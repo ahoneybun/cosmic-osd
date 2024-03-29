@@ -1,3 +1,5 @@
+#![allow(irrefutable_let_patterns)]
+
 use cosmic::{
     iced::{self, Application, Command, Subscription},
     iced_runtime::window::Id as SurfaceId,
@@ -7,8 +9,8 @@ use cosmic::{
 use std::collections::HashMap;
 
 use crate::{
-    components::polkit_dialog,
-    subscriptions::{dbus, polkit_agent, settings_daemon},
+    components::{osd_indicator, polkit_dialog},
+    subscriptions::{airplane_mode, dbus, polkit_agent, pulse, settings_daemon},
 };
 
 #[derive(Debug)]
@@ -17,6 +19,9 @@ pub enum Msg {
     PolkitAgent(polkit_agent::Event),
     PolkitDialog((SurfaceId, polkit_dialog::Msg)),
     SettingsDaemon(settings_daemon::Event),
+    Pulse(pulse::Event),
+    OsdIndicator(osd_indicator::Msg),
+    AirplaneMode(bool),
 }
 
 enum Surface {
@@ -25,10 +30,31 @@ enum Surface {
 
 #[derive(Default)]
 struct App {
-    max_surface_id: u128,
     connection: Option<zbus::Connection>,
     system_connection: Option<zbus::Connection>,
     surfaces: HashMap<SurfaceId, Surface>,
+    indicator: Option<(SurfaceId, osd_indicator::State)>,
+    display_brightness: Option<i32>,
+    keyboard_brightness: Option<i32>,
+    sink_volume: Option<u32>,
+    sink_mute: Option<bool>,
+    source_volume: Option<u32>,
+    source_mute: Option<bool>,
+    airplane_mode: Option<bool>,
+}
+
+impl App {
+    fn create_indicator(&mut self, params: osd_indicator::Params) -> Command<Msg> {
+        if let Some((_id, ref mut state)) = &mut self.indicator {
+            state.replace_params(params)
+        } else {
+            let id = SurfaceId::unique();
+            let (state, cmd) = osd_indicator::State::new(id, params);
+            self.indicator = Some((id, state));
+            cmd
+        }
+        .map(Msg::OsdIndicator)
+    }
 }
 
 impl Application for App {
@@ -62,22 +88,21 @@ impl Application for App {
                         self.system_connection = Some(connection)
                     }
                     dbus::Event::Error(context, err) => {
-                        eprintln!("Failed to {}: {}", context, err);
+                        log::error!("Failed to {}: {}", context, err);
                     }
                 }
                 iced::Command::none()
             }
             Msg::PolkitAgent(event) => match event {
                 polkit_agent::Event::CreateDialog(params) => {
-                    println!("create: {}", params.cookie);
+                    log::trace!("create polkit dialog: {}", params.cookie);
                     let id = SurfaceId::unique();
                     let (state, cmd) = polkit_dialog::State::new(id, params);
-                    self.surfaces
-                        .insert(id.clone(), Surface::PolkitDialog(state));
+                    self.surfaces.insert(id, Surface::PolkitDialog(state));
                     cmd
                 }
                 polkit_agent::Event::CancelDialog { cookie } => {
-                    println!("cancel: {}", cookie);
+                    log::trace!("cancel polkit dialog: {}", cookie);
                     if let Some((id, _)) = self.surfaces.iter().find(|(_id, surface)| {
                         if let Surface::PolkitDialog(state) = surface {
                             state.params.cookie == cookie
@@ -97,19 +122,106 @@ impl Application for App {
                 }
             },
             Msg::PolkitDialog((id, msg)) => {
-                if let Some(surface) = self.surfaces.remove(&id) {
-                    if let Surface::PolkitDialog(state) = surface {
-                        let (state, cmd) = state.update(msg);
-                        if let Some(state) = state {
-                            self.surfaces.insert(id, Surface::PolkitDialog(state));
+                if let Some(Surface::PolkitDialog(state)) = self.surfaces.remove(&id) {
+                    let (state, cmd) = state.update(msg);
+                    if let Some(state) = state {
+                        self.surfaces.insert(id, Surface::PolkitDialog(state));
+                    }
+                    return cmd.map(move |msg| Msg::PolkitDialog((id, msg)));
+                }
+                Command::none()
+            }
+            Msg::OsdIndicator(msg) => {
+                if let Some((id, state)) = self.indicator.take() {
+                    let (state, cmd) = state.update(msg);
+                    if let Some(state) = state {
+                        self.indicator = Some((id, state));
+                    }
+                    cmd.map(Msg::OsdIndicator)
+                } else {
+                    Command::none()
+                }
+            }
+            Msg::SettingsDaemon(settings_daemon::Event::DisplayBrightness(brightness)) => {
+                if self.display_brightness.is_none() {
+                    self.display_brightness = Some(brightness);
+                    Command::none()
+                } else if self.display_brightness != Some(brightness) {
+                    self.display_brightness = Some(brightness);
+                    self.create_indicator(osd_indicator::Params::DisplayBrightness(brightness))
+                } else {
+                    Command::none()
+                }
+            }
+            Msg::SettingsDaemon(settings_daemon::Event::KeyboardBrightness(brightness)) => {
+                if self.keyboard_brightness.is_none() {
+                    self.keyboard_brightness = Some(brightness);
+                    Command::none()
+                } else if self.keyboard_brightness != Some(brightness) {
+                    self.keyboard_brightness = Some(brightness);
+                    self.create_indicator(osd_indicator::Params::KeyboardBrightness(brightness))
+                } else {
+                    Command::none()
+                }
+            }
+            Msg::Pulse(evt) => {
+                match evt {
+                    pulse::Event::SinkMute(mute) => {
+                        if self.sink_mute.is_none() {
+                            self.sink_mute = Some(mute);
+                        } else if self.sink_mute != Some(mute) {
+                            self.sink_mute = Some(mute);
+                            if mute {
+                                return self.create_indicator(osd_indicator::Params::SinkMute);
+                            } else if let Some(sink_volume) = self.sink_volume {
+                                return self.create_indicator(osd_indicator::Params::SinkVolume(
+                                    sink_volume,
+                                ));
+                            }
                         }
-                        return cmd.map(move |msg| Msg::PolkitDialog((id, msg)));
+                    }
+                    pulse::Event::SinkVolume(volume) => {
+                        if self.sink_volume.is_none() {
+                            self.sink_volume = Some(volume);
+                        } else if self.sink_volume != Some(volume) {
+                            self.sink_volume = Some(volume);
+                            return self
+                                .create_indicator(osd_indicator::Params::SinkVolume(volume));
+                        }
+                    }
+                    pulse::Event::SourceMute(mute) => {
+                        if self.source_mute.is_none() {
+                            self.source_mute = Some(mute);
+                        } else if self.source_mute != Some(mute) {
+                            self.source_mute = Some(mute);
+                            if mute {
+                                return self.create_indicator(osd_indicator::Params::SourceMute);
+                            } else if let Some(source_volume) = self.source_volume {
+                                return self.create_indicator(osd_indicator::Params::SourceVolume(
+                                    source_volume,
+                                ));
+                            }
+                        }
+                    }
+                    pulse::Event::SourceVolume(volume) => {
+                        if self.source_volume.is_none() {
+                            self.source_volume = Some(volume);
+                        } else if self.source_volume != Some(volume) {
+                            self.source_volume = Some(volume);
+                            return self
+                                .create_indicator(osd_indicator::Params::SourceVolume(volume));
+                        }
                     }
                 }
                 Command::none()
             }
-            Msg::SettingsDaemon(event) => {
-                println!("{:?}", event);
+            Msg::AirplaneMode(state) => {
+                if self.airplane_mode.is_none() {
+                    self.airplane_mode = Some(state);
+                } else if self.airplane_mode != Some(state) {
+                    self.airplane_mode = Some(state);
+                    return self.create_indicator(osd_indicator::Params::AirplaneMode(state));
+                }
                 Command::none()
             }
         }
@@ -128,6 +240,10 @@ impl Application for App {
             subscriptions.push(settings_daemon::subscription(connection).map(Msg::SettingsDaemon));
         }
 
+        subscriptions.push(pulse::subscription().map(Msg::Pulse));
+
+        subscriptions.push(airplane_mode::subscription().map(Msg::AirplaneMode));
+
         subscriptions.extend(self.surfaces.iter().map(|(id, surface)| match surface {
             Surface::PolkitDialog(state) => state.subscription().with(*id).map(Msg::PolkitDialog),
         }));
@@ -142,6 +258,10 @@ impl Application for App {
                     state.view().map(move |msg| Msg::PolkitDialog((id, msg)))
                 }
             };
+        } else if let Some((indicator_id, state)) = &self.indicator {
+            if id == *indicator_id {
+                return state.view().map(Msg::OsdIndicator);
+            }
         }
         iced::widget::text("").into() // XXX
     }
